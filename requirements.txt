@@ -10,5 +10,5 @@ pytest
 sqlalchemy
 psycopg[binary]
 pyjwt
-openai
+google-genai
 python-dotenv

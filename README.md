@@ -29,7 +29,7 @@ custom/
     abac.py           # attribute-based access control (evaluate + SQL compile)
     rag.py            # ask() orchestrator + shared retrieve() core
     chat.py           # unified chat: guard -> mask -> route -> retrieve -> answer -> demask
-    llm.py            # shared GLM client (openai-compatible, Z.ai endpoint)
+    llm.py            # shared Gemini client (google-genai SDK)
     ingest.py         # python -m guard.ingest: JSON -> documents/chunks
     logconf.py        # shared [guard] terminal logging setup
     cli.py            # terminal interface
@@ -390,18 +390,18 @@ their `RAG_QUERY` / disposition rows exactly as before, and `/v1/chat`
 additionally writes the guard-stage rows (REJECT/MASKED) that `screen()`
 already emits - only the per-request audit row is new.
 
-## GLM LLM client
+## Gemini LLM client
 
-`guard/llm.py` exposes a shared, reusable client for GLM 5.2 (Z.ai's
-OpenAI-compatible endpoint) so any module - now or later - can make LLM calls
-without knowing about credentials or SDK plumbing. Credentials live in
-`custom/.env`, loaded by `python-dotenv` when `guard.llm` is imported;
-variables already set in the shell always win:
+`guard/llm.py` exposes a shared, reusable client for Gemini
+(`gemini-3.8-flash` via the `google-genai` SDK) so any module - now or later -
+can make LLM calls without knowing about credentials or SDK plumbing.
+Credentials live in `custom/.env`, loaded by `python-dotenv` when `guard.llm`
+is imported; variables already set in the shell always win:
 
 ```dotenv
-GUARD_LLM_API_KEY=your-zai-api-key-here
-# GUARD_LLM_BASE_URL=https://api.z.ai/api/paas/v4/
-# GUARD_LLM_MODEL=glm-5.2
+GOOGLE_API_KEY=your-google-api-key-here
+# GUARD_LLM_API_KEY=your-google-api-key-here  (takes precedence over GOOGLE_API_KEY)
+# GUARD_LLM_MODEL=gemini-3.8-flash
 # GUARD_LLM_TIMEOUT=60
 ```
 
@@ -423,7 +423,7 @@ print(reply.content, reply.usage)
 ```
 
 `get_client()` returns a lazily created shared instance configured from the
-`GUARD_LLM_*` variables; construct `GLMClient(api_key=..., model=...)`
+environment; construct `GeminiClient(api_key=..., model=...)`
 directly for custom instances. A missing API key (or any API error) raises
 `LLMClientError` at call time - importing the module never fails, so offline
 runs and tests are unaffected. Message content is never logged.
@@ -511,10 +511,10 @@ One JSON line per flagged event, snippet masked before writing. RAG events
 | `GUARD_DATABASE_URL`   | `postgresql+psycopg://postgres:postgres@localhost:5433/guardrail_poc` | SQLAlchemy URL for the users/documents/chunks store. |
 | `GUARD_JWT_SECRET`     | `guardrail-poc-dev-secret-change-me`             | HS256 signing secret for JWTs (change outside dev). |
 | `GUARD_JWT_EXPIRE_MINUTES` | `1440`                                      | Token lifetime in minutes (default 24h).        |
-| `GUARD_LLM_API_KEY`   | (none)                                           | Z.ai API key for the shared GLM client; put it in `custom/.env` (see "GLM LLM client"). |
-| `GUARD_LLM_BASE_URL`  | `https://api.z.ai/api/paas/v4/`                  | OpenAI-compatible endpoint the GLM client calls (BigModel China: `https://open.bigmodel.cn/api/paas/v4/`). |
-| `GUARD_LLM_MODEL`     | `glm-5.2`                                        | Model id the GLM client requests.               |
-| `GUARD_LLM_TIMEOUT`   | `60`                                             | GLM client per-request timeout in seconds.      |
+| `GOOGLE_API_KEY`      | (none)                                           | Google API key for the shared Gemini client; put it in `custom/.env` (see "Gemini LLM client"). |
+| `GUARD_LLM_API_KEY`   | (none)                                           | Explicit key override for the Gemini client; takes precedence over `GOOGLE_API_KEY`. |
+| `GUARD_LLM_MODEL`     | `gemini-3.8-flash`                               | Model id the Gemini client requests.            |
+| `GUARD_LLM_TIMEOUT`   | `60`                                             | Gemini client per-request timeout in seconds.   |
 
 ## Tests
 
