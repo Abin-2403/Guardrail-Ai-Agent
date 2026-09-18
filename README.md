@@ -12,6 +12,7 @@ Standalone Python module that screens user prompts in two stages and reports fla
    | `data/patients.json` | patient details + medicines they use | `doc_type=patient_record`, `sensitivity=restricted` | `role=admin` only |
 
    Retrieval is retrieval-only (no LLM call): the response returns permitted chunks, an assembled context with `[1]`, `[2]` citation markers, and a citations list. Generation can be layered on downstream without schema changes.
+4. **Stage 4 - Unified chat** (`POST /v1/chat`): the full chain in one call - prompt guard, **reversible** PII masking (indexed `[REDACTED_1]`, `[REDACTED_2]`, ... placeholders), an LLM router call that decides whether RAG is needed, ABAC-filtered retrieval, a second LLM call that answers from the masked prompt plus context, and finally demasking of the answer. Every request writes one row to the new `audit_log` Postgres table (masked content only). See "Unified chat endpoint".
 
 Flagged events are also appended to `flags.jsonl` (snippets are Presidio-masked first, so raw PII is never written to disk).
 
@@ -26,7 +27,8 @@ custom/
     auth.py           # JWT (HS256) bearer auth dependencies
     db.py             # SQLAlchemy store: users, documents, chunks (Postgres)
     abac.py           # attribute-based access control (evaluate + SQL compile)
-    rag.py            # ask() orchestrator: screen -> embed -> ABAC retrieval
+    rag.py            # ask() orchestrator + shared retrieve() core
+    chat.py           # unified chat: guard -> mask -> route -> retrieve -> answer -> demask
     llm.py            # shared GLM client (openai-compatible, Z.ai endpoint)
     ingest.py         # python -m guard.ingest: JSON -> documents/chunks
     logconf.py        # shared [guard] terminal logging setup
@@ -49,6 +51,7 @@ custom/
     test_embedding.py # embedding fallback determinism tests
     test_ingest.py    # ingestion tests
     test_rag.py       # ask() orchestrator tests
+    test_chat.py      # unified chat orchestrator + endpoint tests
   requirements.txt
   flags.jsonl         # created at runtime
 ```
@@ -150,7 +153,9 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 | POST   | `/v1/token`    | -                    | `{"username": "admin" \| "user1" \| "user2"}` | Issue a JWT for the chosen mock user (dropdown in `/docs`). |
 | POST   | `/v1/screen`   | Bearer token         | `{"prompt": "..."}`                           | Screen one prompt; full result as JSON.            |
 | POST   | `/v1/ask`      | Bearer token         | `{"question": "...", "top_k"?: n}`            | RAG retrieval over ABAC-permitted chunks; returns chunks + assembled context + citations. |
-| GET    | `/v1/users/me` | Bearer token         | -                                             | Details of the authenticated user.                 |
+| POST   | `/v1/chat`     | Bearer token         | `{"prompt": "...", "top_k"?: n}`              | Unified chain: guard -> reversible mask -> LLM router -> ABAC retrieval -> LLM answer -> demask; one `audit_log` row per request. |
+| GET    | `/v1/audit`    | Bearer token (admin) | `?limit=n` (default 20, max 100)              | Latest chat audit rows (masked content only). |
+| GET    | `/v1/users/me` | Bearer token         | -                                             | Details of the authenticated user. |
 | GET    | `/v1/users`    | Bearer token (admin) | -                                             | List all users (admin only).                       |
 | GET    | `/v1/documents`| Bearer token (admin) | -                                             | List indexed documents with attributes + chunk counts (admin only). |
 
@@ -161,9 +166,9 @@ Mock users live in Postgres and are seeded at startup; there are no passwords:
 
 | Username | Role  | Access                                                    |
 |----------|-------|-----------------------------------------------------------|
-| `admin`  | admin | everything, including patient records, `GET /v1/users`, `GET /v1/documents` |
-| `user1`  | user  | `/v1/screen`, `/v1/ask` (public chunks only), `/v1/users/me` |
-| `user2`  | user  | `/v1/screen`, `/v1/ask` (public chunks only), `/v1/users/me` |
+| `admin`  | admin | everything, including patient records, `GET /v1/users`, `GET /v1/documents`, `GET /v1/audit` |
+| `user1`  | user  | `/v1/screen`, `/v1/ask`, `/v1/chat` (public chunks only), `/v1/users/me` |
+| `user2`  | user  | `/v1/screen`, `/v1/ask`, `/v1/chat` (public chunks only), `/v1/users/me` |
 
 Get a token (the request body is a username dropdown in `/docs`):
 
@@ -289,6 +294,101 @@ chunk text and patient names are never logged:
 
 Admins can inspect the index through `GET /v1/documents` (documents with
 attributes and chunk counts); regular users get `403`.
+
+## Unified chat endpoint
+
+`POST /v1/chat` runs the whole guardrail chain per request and returns the
+**demasked** answer plus citations, while everything that is logged stays
+masked:
+
+```
+prompt guard (Prompt-Guard)
+   |-> REJECT: halt, audit row, 200 + block message (no LLM call)
+reversible PII masking ([REDACTED_1], [REDACTED_2], ... + per-request mapping)
+   |
+LLM router call (temperature 0, strict JSON {needs_rag, search_query})
+   |-> malformed JSON / API error: fallback needs_rag=false (reason audited)
+   |
+   |-> needs_rag: ABAC-filtered retrieval (same engine + injection re-scan as /v1/ask)
+   |
+LLM answer call (masked prompt + assembled context, cite as [n],
+                 keep [REDACTED_n] tokens verbatim)
+   |
+demask the LLM output -> unmasked answer to the caller
+```
+
+```powershell
+$token = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "user1"}').access_token
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/chat" -Method Post `
+  -ContentType "application/json" -Headers @{ Authorization = "Bearer $token" } `
+  -Body '{"prompt": "email maria@example.com: which medicines treat a fever?"}'
+```
+
+Response (PII case, abridged):
+
+```json
+{
+  "status": "ANSWER",
+  "disposition": "MASKED",
+  "answer": "email maria@example.com: Paracetamol is a pain reliever and fever reducer. [1]",
+  "message": "Answer generated with 2 retrieved chunk(s).",
+  "citations": [{"document_id": 1, "chunk_id": 2, "title": "Medicine catalog", "score": 0.31}],
+  "verdict": {"label": "BENIGN", "benign_score": 0.99, "suspicious_score": 0.01, "engine": "hf"},
+  "masking": {"entities": {"EMAIL_ADDRESS": 1}, "engine": "presidio"},
+  "used_rag": true,
+  "audit_id": 42
+}
+```
+
+Behavior details:
+
+- **Jailbreak prompts** return HTTP 200 with the standard block message,
+  `status: "REJECTED"`, `answer: null` - exactly like `/v1/ask`.
+- **ABAC stays inside the SQL**: the router decides *whether* to retrieve,
+  never *what* - `user1`/`user2` never see patient chunks even if the router
+  asks for "every document"; admins do.
+- **Answer-call LLM failures** return HTTP 502 after an `LLM_ERROR` audit row
+  is written; router failures never surface - they fall back to no-RAG.
+- If the LLM mangles or drops a placeholder, the token simply stays visible
+  in the answer (`demasking.unmatched_count` in the audit row records it);
+  demasking never fails the request.
+- Known POC limitation: a prompt that already contains a literal
+  `[REDACTED_1]` token could collide with a generated placeholder.
+
+### Audit log (`audit_log` table)
+
+Every chat request writes one row, auto-created by startup `create_all` (no
+migration needed on existing deployments). Stored columns - masked content
+only; **never** the raw prompt, the demasked answer, or mapping values:
+
+| Column          | Content                                                                                          |
+|-----------------|--------------------------------------------------------------------------------------------------|
+| `ts`, `username`, `role`, `status` | who/when/outcome (`ANSWER`, `REJECTED`, `LLM_ERROR`).            |
+| `masked_prompt` | the prompt after reversible masking (`null` for REJECT - the raw prompt is never stored).        |
+| `guard`         | `{disposition, rules, label, suspicious_score, threshold, engine}`.                              |
+| `masking`       | `{engine, entities: {type: count}, placeholder_count}`.                                          |
+| `router`        | `{needs_rag, search_query, fallback_reason?}`.                                                   |
+| `rag`           | `{policy_version, permitted_chunks, chunk_ids: [{id, document_id, title, score}], dropped_chunk_ids, embedding_engine, engine_mismatch}`. |
+| `llm`           | `{model, finish_reason, usage, latency_ms, answer_masked}` - the LLM output **before** demasking. |
+| `demasking`     | `{restored_count, unmatched_count}`.                                                             |
+
+`GET /v1/audit` (admin only) lists the latest rows (default 20,
+`?limit=` up to 100, newest first):
+
+```powershell
+$admin = (Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/token" -Method Post `
+  -ContentType "application/json" -Body '{"username": "admin"}').access_token
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/audit?limit=5" `
+  -Headers @{ Authorization = "Bearer $admin" }
+```
+
+`flags.jsonl` behavior is unchanged: `/v1/screen` and `/v1/ask` still write
+their `RAG_QUERY` / disposition rows exactly as before, and `/v1/chat`
+additionally writes the guard-stage rows (REJECT/MASKED) that `screen()`
+already emits - only the per-request audit row is new.
 
 ## GLM LLM client
 

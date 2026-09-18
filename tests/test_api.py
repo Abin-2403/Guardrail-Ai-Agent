@@ -6,7 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 from guard import api
 from guard.auth import create_access_token
-from guard.db import Chunk, Document, get_session, init_db
+from guard.db import AuditLog, Chunk, Document, get_session, init_db
 from guard.pipeline import GuardResult
 from guard.steps.masking import MaskingResult
 from guard.steps.prompt_guard import PromptGuardVerdict
@@ -373,6 +373,56 @@ def test_documents_forbidden_for_regular_user(client):
     response = client.get("/v1/documents", headers=bearer(token))
     assert response.status_code == 403
     assert response.json()["detail"] == "Admin privileges required"
+
+
+def test_audit_forbidden_for_regular_user(client):
+    token = get_token(client, "user1")
+    response = client.get("/v1/audit", headers=bearer(token))
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin privileges required"
+
+
+def test_audit_admin_lists_rows_newest_first(client, db_session_factory):
+    with db_session_factory() as session:
+        session.add_all(
+            [
+                AuditLog(
+                    username="user1",
+                    role="user",
+                    status="ANSWER",
+                    masked_prompt="hi [REDACTED_1]",
+                    guard={"disposition": "MASKED", "rules": ["PII_DETECTED"]},
+                    masking={"engine": "presidio", "entities": {"PERSON": 1}, "placeholder_count": 1},
+                    router={"needs_rag": False, "search_query": ""},
+                    demasking={"restored_count": 1, "unmatched_count": 0},
+                ),
+                AuditLog(
+                    username="admin",
+                    role="admin",
+                    status="REJECTED",
+                    masked_prompt=None,
+                    guard={"disposition": "REJECT", "rules": ["PROMPT_GUARD_SUSPICIOUS"]},
+                ),
+            ]
+        )
+        session.commit()
+    token = get_token(client, "admin")
+    response = client.get("/v1/audit", headers=bearer(token))
+    assert response.status_code == 200
+    rows = response.json()
+    assert [row["status"] for row in rows] == ["REJECTED", "ANSWER"]
+    assert rows[0]["username"] == "admin"
+    assert rows[1]["masked_prompt"] == "hi [REDACTED_1]"
+    assert rows[1]["rag"] is None and rows[1]["llm"] is None
+    assert rows[1]["masking"]["placeholder_count"] == 1
+
+
+def test_audit_limit_bounds_validated(client):
+    token = get_token(client, "admin")
+    response = client.get("/v1/audit?limit=0", headers=bearer(token))
+    assert response.status_code == 422
+    response = client.get("/v1/audit?limit=101", headers=bearer(token))
+    assert response.status_code == 422
 
 
 def test_documents_admin_lists_documents_with_chunk_counts(client, db_session_factory):
